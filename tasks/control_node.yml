@@ -1,0 +1,35 @@
+---
+# Read the step-ca configuration of the control node (runs on localhost).
+- name: Read config.env of ansible-inventory-generator-step-ca
+  ansible.builtin.slurp:
+    src: "{{ ssh_ca_dir }}/config.env"
+  register: kd_config_raw
+
+- name: Read the SSH user and host CA keys from step-ca
+  ansible.builtin.command: step ssh config {{ item }} --roots
+  loop: ["", "--host"]
+  environment:
+    STEPPATH: "{{ ssh_ca_steppath }}"
+  register: kd_roots
+  changed_when: false
+
+- name: Read the registry of distributed certificates
+  ansible.builtin.set_fact:
+    kd_entries: "{{ (lookup('ansible.builtin.file', kd_registry, errors='ignore') | default('[]', true)) | from_json }}"
+
+- name: Remember the control node data
+  vars:
+    kd_config: "{{ kd_config_raw.content | b64decode }}"
+  ansible.builtin.set_fact:
+    kd_user_ca: "{{ kd_roots.results[0].stdout | trim }}"
+    kd_host_ca: "{{ kd_roots.results[1].stdout | trim }}"
+    kd_provisioner: "{{ kd_config | regex_search('(?m)^PROVISIONER=(.*)$', '\\1') | first | regex_replace(\"^'|'$\", '') }}"
+    kd_ca_host: "{{ (kd_config | regex_search('(?m)^CA_HOST=(.*)$', '\\1') | default([''], true) | first) | regex_replace(\"^'|'$\", '') | regex_replace('^$', '') }}"
+
+- name: Check the step-ca setup
+  ansible.builtin.assert:
+    that:
+      - kd_user_ca | length > 0
+      - kd_host_ca | length > 0
+      - kd_provisioner | length > 0
+    fail_msg: "Set up the control node with ansible-inventory-generator-step-ca first ({{ ssh_ca_dir }})."

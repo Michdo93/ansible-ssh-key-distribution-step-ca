@@ -1,0 +1,154 @@
+---
+# Give an account on one host (e.g. openhab on the openHAB VM) a short-lived step-ca SSH
+# certificate and let accounts on other hosts accept it - instead of copying public keys.
+#   ansible-playbook distribute.yml -e source_host=openhab-vm -e source_user=openhab -e target_user=pi
+
+- name: Control node and CA
+  hosts: localhost
+  gather_facts: false
+  vars_files: [defaults.yml]
+  tasks:
+    - name: Check the input
+      ansible.builtin.assert:
+        that:
+          - source_host | length > 0
+          - source_host in groups['all']
+          - "'@' not in cert_principal"
+        fail_msg: "Set -e source_host=<inventory name> (and a cert_principal without '@')."
+
+    - name: Read the step-ca configuration
+      ansible.builtin.include_tasks: tasks/control_node.yml
+
+    - name: Allow the principal on the managed CA host
+      ansible.builtin.include_tasks:
+        file: tasks/ca_policy.yml
+        apply:
+          delegate_to: "{{ kd_ca_host }}"
+          become: true
+      vars:
+        kd_policy_action: add
+      when: kd_ca_host | length > 0
+
+- name: Key pair and certificate on the source host
+  hosts: "{{ source_host }}"
+  gather_facts: false
+  become: true
+  vars_files: [defaults.yml]
+  vars:
+    kd: "{{ hostvars['localhost'] }}"
+    kd_s_user: "{{ source_user }}"
+    kd_s_key: "{{ key_file_name }}"
+    kd_s_principal: "{{ cert_principal }}"
+  tasks:
+    - name: Issue the certificate
+      ansible.builtin.include_tasks: tasks/source_cert.yml
+
+- name: Accept the principal on the targets
+  hosts: "{{ target_hosts }}:!{{ source_host }}"
+  gather_facts: true
+  become: true
+  vars_files: [defaults.yml]
+  vars:
+    # -e target_user wins; otherwise the host's own key_targets; otherwise its ansible_user.
+    kd_users: >-
+      {{ [target_user] if target_user | length > 0
+         else (([key_targets] if key_targets is string else key_targets | list) if key_targets is defined
+               else [ansible_user]) }}
+  tasks:
+    - name: Linux / Unix targets
+      ansible.builtin.include_tasks: tasks/target_linux.yml
+      when: ansible_facts['os_family'] != 'Windows'
+
+    - name: Windows targets
+      ansible.builtin.include_tasks: tasks/target_windows.yml
+      when: ansible_facts['os_family'] == 'Windows'
+
+- name: Trust the host CA on the source host, verify and register
+  hosts: "{{ source_host }}"
+  gather_facts: false
+  become: true
+  vars_files: [defaults.yml]
+  vars:
+    kd: "{{ hostvars['localhost'] }}"
+    kd_done: >-
+      {{ query('inventory_hostnames', target_hosts ~ ':!' ~ source_host)
+         | map('extract', hostvars) | selectattr('kd_record', 'defined') | map(attribute='kd_record') | list }}
+  tasks:
+    - name: Trust the host CA for the targets (known_hosts of {{ source_user }})
+      ansible.builtin.blockinfile:
+        path: "{{ kd_home }}/.ssh/known_hosts"
+        create: true
+        owner: "{{ source_user }}"
+        group: "{{ kd_group }}"
+        mode: "0644"
+        marker: "# {mark} ansible-ssh-key-distribution-step-ca host CA"
+        block: |
+          {% set names = [] %}
+          {% for t in kd_done %}
+          {%   for n in [t.address, t.alias] %}
+          {%     set _ = names.append(n if t.port | int == 22 else '[' ~ n ~ ']:' ~ t.port) %}
+          {%   endfor %}
+          {% endfor %}
+          {% for key in kd.kd_host_ca.splitlines() %}
+          @cert-authority {{ names | unique | join(',') }} {{ key }}
+          {% endfor %}
+      when: distribute_known_hosts | bool and kd_done | length > 0
+
+    - name: Test certificate logins from {{ source_user }}@{{ source_host }}
+      ansible.builtin.command:
+        argv:
+          - runuser
+          - -u
+          - "{{ source_user }}"
+          - --
+          - ssh
+          - -o
+          - BatchMode=yes
+          - -o
+          - ConnectTimeout=10
+          - -o
+          - IdentitiesOnly=yes
+          - -o
+          - "StrictHostKeyChecking={{ 'yes' if distribute_known_hosts | bool else 'accept-new' }}"
+          - -i
+          - "{{ kd_key }}"
+          - -p
+          - "{{ item.0.port }}"
+          - "{{ item.1 }}@{{ item.0.address }}"
+          - exit
+      loop: "{{ kd_done | subelements('users') }}"
+      loop_control:
+        label: "{{ item.1 }}@{{ item.0.address }}"
+      changed_when: false
+      when: verify_logins | bool
+
+    - name: Register the distribution (renew.yml re-issues the certificate)
+      delegate_to: localhost
+      become: false
+      vars:
+        kd_entry:
+          source_host: "{{ source_host }}"
+          source_user: "{{ source_user }}"
+          key_file_name: "{{ key_file_name }}"
+          cert_principal: "{{ cert_principal }}"
+          cert_duration: "{{ cert_duration }}"
+          targets: "{{ kd_done | map(attribute='alias') | list }}"
+      ansible.builtin.copy:
+        dest: "{{ kd_registry }}"
+        mode: "0600"
+        content: >-
+          {{ (kd.kd_entries | rejectattr('cert_principal', 'equalto', cert_principal) | list + [kd_entry])
+             | to_nice_json(indent=2) }}
+
+    - name: Renew the certificates regularly (cron on the control node)
+      delegate_to: localhost
+      become: false
+      ansible.builtin.cron:
+        name: ansible-ssh-key-distribution-step-ca renew
+        minute: "{{ renew_cron_minute }}"
+        hour: "{{ renew_cron_hour }}"
+        job: >-
+          ANSIBLE_CONFIG={{ ansible_config_file }} ANSIBLE_STEP_CA_DIR={{ ssh_ca_dir }}
+          {{ lookup('ansible.builtin.pipe', 'command -v ansible-playbook') }} -i {{ ansible_inventory_sources | first }}
+          {{ playbook_dir }}/renew.yml >> {{ ssh_ca_dir }}/renew.log 2>&1
+      when: install_renew_cron | bool

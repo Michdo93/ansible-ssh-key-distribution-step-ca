@@ -1,0 +1,15 @@
+---
+- name: Remove the principal (Windows OpenSSH)
+  ansible.windows.win_powershell:
+    parameters:
+      Users: "{{ kd_users | join(',') }}"
+      Principal: "{{ cert_principal }}"
+    script: |
+      param([string]$Users, [string]$Principal)
+      $Ansible.Changed = $false
+      foreach ($u in ($Users -split ',')) {
+        $f = Join-Path $env:ProgramData "ssh\auth_principals\$u"
+        if (-not (Test-Path $f)) { continue }
+        $all = @(Get-Content $f); $keep = @($all | Where-Object { $_ -ne $Principal })
+        if ($keep.Count -ne $all.Count) { Set-Content -LiteralPath $f -Value $keep -Encoding ascii; $Ansible.Changed = $true }
+      }

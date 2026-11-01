@@ -1,0 +1,36 @@
+---
+# Defaults for distribute.yml / renew.yml / revoke.yml. Override with -e.
+# Requires a control node set up with ansible-inventory-generator-step-ca and
+# hosts enrolled by its enroll.yml (they trust the step-ca SSH user CA).
+
+# Host (inventory name) whose account gets the key pair and certificate. Required.
+source_host: ""
+# Account on the source host that owns the key pair (e.g. openhab). Default: its ansible_user.
+source_user: "{{ hostvars[source_host].ansible_user | default('root') }}"
+key_type: ed25519
+key_file_name: "id_{{ key_type }}"
+# Principal written into the certificate and accepted by the target accounts.
+# Must be allowed by the CA policy (added automatically when the CA host is managed
+# by ansible-inventory-generator-step-ca). No "@" (step-ca treats it as an e-mail address).
+cert_principal: "{{ source_user }}.{{ source_host }}"
+# Lifetime of the certificate; renew.yml re-issues it (cron on the control node).
+cert_duration: 24h
+# Cron schedule on the control node for renew.yml (every 6 hours by default).
+renew_cron_minute: "23"
+renew_cron_hour: "*/6"
+install_renew_cron: true
+
+# Hosts and accounts that accept the certificate (same rules as ansible-ssh-key-distribution):
+# -e target_user=pi for all targets, otherwise key_targets per host, otherwise ansible_user.
+target_hosts: all
+target_user: ""
+skip_missing_users: false
+# Write the host CA into known_hosts of the source user (no fingerprint prompts).
+distribute_known_hosts: true
+verify_logins: true
+
+# Control node configuration written by ansible-inventory-generator-step-ca.
+ssh_ca_dir: "{{ lookup('env', 'ANSIBLE_STEP_CA_DIR') | default(lookup('env', 'HOME') ~ '/.config/ansible-step-ca', true) }}"
+ssh_ca_steppath: "{{ ssh_ca_dir }}/step"
+ssh_ca_provisioner_password_file: "{{ ssh_ca_dir }}/provisioner-password"
+kd_registry: "{{ ssh_ca_dir }}/distributions.json"

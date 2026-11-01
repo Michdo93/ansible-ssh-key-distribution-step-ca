@@ -1,0 +1,28 @@
+---
+- name: Check that this host trusts the step-ca user CA (enroll.yml)
+  ansible.builtin.command: sshd -T
+  register: kd_sshd_t
+  changed_when: false
+
+- name: Fail if the host is not enrolled
+  ansible.builtin.assert:
+    that:
+      - kd_sshd_t.stdout_lines | select('match', '^trustedusercakeys ') | list | length > 0
+      - "'authorizedprincipalsfile /etc/ssh/auth_principals/%u' in kd_sshd_t.stdout_lines"
+    fail_msg: >-
+      {{ inventory_hostname }} does not trust the step-ca user CA yet. Enroll it with
+      ansible-inventory-generator-step-ca (playbooks/enroll.yml) first.
+
+- name: Accept the principal for each target account
+  ansible.builtin.include_tasks: target_linux_user.yml
+  loop: "{{ kd_users }}"
+  loop_control:
+    loop_var: kd_target
+
+- name: Remember connection data for the source host
+  ansible.builtin.set_fact:
+    kd_record:
+      users: "{{ kd_users_done | default([]) }}"
+      address: "{{ ansible_host | default(inventory_hostname) }}"
+      alias: "{{ inventory_hostname }}"
+      port: "{{ ansible_port | default(22) }}"

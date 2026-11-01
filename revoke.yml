@@ -1,0 +1,85 @@
+---
+# Undo distribute.yml: the targets stop accepting the principal immediately, the certificate
+# is deleted on the source host and no longer renewed. The key pair itself stays.
+#   ansible-playbook revoke.yml -e source_host=openhab-vm -e source_user=openhab [-e target_user=pi]
+
+- name: Control node and CA
+  hosts: localhost
+  gather_facts: false
+  vars_files: [defaults.yml]
+  tasks:
+    - name: Check the input
+      ansible.builtin.assert:
+        that: source_host | length > 0
+        fail_msg: "Set -e source_host=<inventory name>."
+
+    - name: Read the step-ca configuration
+      ansible.builtin.include_tasks: tasks/control_node.yml
+
+- name: Remove the principal from the targets
+  hosts: "{{ target_hosts }}:!{{ source_host }}"
+  gather_facts: true
+  become: true
+  vars_files: [defaults.yml]
+  vars:
+    kd_users: >-
+      {{ [target_user] if target_user | length > 0
+         else (([key_targets] if key_targets is string else key_targets | list) if key_targets is defined
+               else [ansible_user]) }}
+  tasks:
+    - name: Linux / Unix targets
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/auth_principals/{{ item }}
+        line: "{{ cert_principal }}"
+        state: absent
+      loop: "{{ kd_users }}"
+      when: ansible_facts['os_family'] != 'Windows'
+
+    - name: Windows targets
+      ansible.builtin.include_tasks: tasks/target_windows_revoke.yml
+      when: ansible_facts['os_family'] == 'Windows'
+
+- name: Delete the certificate on the source host
+  hosts: "{{ source_host }}"
+  gather_facts: false
+  become: true
+  vars_files: [defaults.yml]
+  tasks:
+    - name: Look up {{ source_user }}
+      ansible.builtin.getent:
+        database: passwd
+        key: "{{ source_user }}"
+
+    - name: Delete {{ key_file_name }}-cert.pub
+      ansible.builtin.file:
+        path: "{{ ansible_facts['getent_passwd'][source_user][4] }}/.ssh/{{ key_file_name }}-cert.pub"
+        state: absent
+
+- name: Stop renewing and remove the principal from the CA policy
+  hosts: localhost
+  gather_facts: false
+  vars_files: [defaults.yml]
+  vars:
+    kd_left: "{{ kd_entries | rejectattr('cert_principal', 'equalto', cert_principal) | list }}"
+  tasks:
+    - name: Update the registry
+      ansible.builtin.copy:
+        dest: "{{ kd_registry }}"
+        content: "{{ kd_left | to_nice_json(indent=2) }}"
+        mode: "0600"
+
+    - name: Remove the renew job when nothing is left
+      ansible.builtin.cron:
+        name: ansible-ssh-key-distribution-step-ca renew
+        state: absent
+      when: kd_left | length == 0
+
+    - name: Remove the principal from the managed CA host
+      ansible.builtin.include_tasks:
+        file: tasks/ca_policy.yml
+        apply:
+          delegate_to: "{{ kd_ca_host }}"
+          become: true
+      vars:
+        kd_policy_action: remove
+      when: kd_ca_host | length > 0

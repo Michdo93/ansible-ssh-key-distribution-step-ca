@@ -1,0 +1,53 @@
+---
+# Add (kd_policy_action=add) or remove (remove) cert_principal in the policy of a step-ca
+# managed by ansible-inventory-generator-step-ca. Runs on the CA host (delegated).
+# /etc/step-ca/extra-principals is honoured by its ca-setup.yml, so a later policy sync
+# keeps these principals.
+- name: Read ca.json
+  ansible.builtin.slurp:
+    src: /etc/step-ca/config/ca.json
+  register: kd_ca_json_raw
+
+- name: Read the extra principals
+  ansible.builtin.slurp:
+    src: /etc/step-ca/extra-principals
+  register: kd_extra_raw
+  failed_when: false
+
+- name: Compute the new principal lists
+  vars:
+    kd_ca_json: "{{ kd_ca_json_raw.content | b64decode | from_json }}"
+    kd_extra_old: "{{ (kd_extra_raw.content | default('') | b64decode).split() }}"
+    kd_policy_old: "{{ kd_ca_json.authority.policy.ssh.user.allow.principal | default([]) }}"
+  ansible.builtin.set_fact:
+    kd_ca_json: "{{ kd_ca_json }}"
+    kd_extra_new: "{{ (kd_extra_old + [cert_principal]) | unique if kd_policy_action == 'add' else kd_extra_old | difference([cert_principal]) }}"
+    kd_policy_new: "{{ (kd_policy_old + [cert_principal]) | unique if kd_policy_action == 'add' else kd_policy_old | difference([cert_principal]) }}"
+    kd_policy_old: "{{ kd_policy_old }}"
+
+- name: Write /etc/step-ca/extra-principals
+  ansible.builtin.copy:
+    dest: /etc/step-ca/extra-principals
+    content: "{{ (kd_extra_new | join('\n') ~ '\n') if kd_extra_new else '' }}"
+    owner: step
+    group: step
+    mode: "0600"
+
+- name: Update the SSH user principal policy
+  vars:
+    kd_ca_json_new: "{{ kd_ca_json | combine({'authority': {'policy': {'ssh': {'user': {'allow': {'principal': kd_policy_new}}}}}}, recursive=true) }}"
+  ansible.builtin.copy:
+    dest: /etc/step-ca/config/ca.json
+    content: "{{ kd_ca_json_new | to_nice_json(indent=2) }}\n"
+    owner: step
+    group: step
+    mode: "0600"
+  register: kd_policy_written
+  when: kd_policy_new | sort != kd_policy_old | sort
+
+- name: Reload step-ca
+  ansible.builtin.shell: |
+    if [ -d /run/systemd/system ] && systemctl is-active --quiet step-ca; then systemctl reload step-ca
+    else pkill -HUP -u step -x step-ca; fi
+    sleep 4
+  when: kd_policy_written is changed

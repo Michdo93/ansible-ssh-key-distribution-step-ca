@@ -1,0 +1,36 @@
+---
+# Windows OpenSSH (ansible.windows collection). Not tested on real hosts yet.
+- name: Accept the principal for the target accounts
+  ansible.windows.win_powershell:
+    parameters:
+      Users: "{{ kd_users | join(',') }}"
+      Principal: "{{ cert_principal }}"
+      SkipMissing: "{{ skip_missing_users | bool }}"
+    script: |
+      param([string]$Users, [string]$Principal, [bool]$SkipMissing)
+      $ErrorActionPreference = 'Stop'
+      $config = Get-Content (Join-Path $env:ProgramData 'ssh\sshd_config') -Raw
+      if ($config -notmatch '(?m)^\s*TrustedUserCAKeys\s' -or $config -notmatch '(?m)^\s*AuthorizedPrincipalsFile\s') {
+        throw 'This host does not trust the step-ca user CA yet. Enroll it with ansible-inventory-generator-step-ca first.'
+      }
+      $dir = Join-Path $env:ProgramData 'ssh\auth_principals'
+      New-Item -ItemType Directory -Path $dir -Force | Out-Null
+      $done = @(); $Ansible.Changed = $false
+      foreach ($u in ($Users -split ',')) {
+        if (-not (Get-LocalUser -Name $u -ErrorAction SilentlyContinue)) { if ($SkipMissing) { continue }; throw "Account $u does not exist." }
+        $f = Join-Path $dir $u
+        $lines = @(if (Test-Path $f) { Get-Content $f })
+        if ($lines -notcontains $Principal) { Set-Content -LiteralPath $f -Value ($lines + $Principal) -Encoding ascii; $Ansible.Changed = $true }
+        & icacls.exe $f /inheritance:r /grant '*S-1-5-32-544:F' /grant '*S-1-5-18:F' /grant '*S-1-5-11:R' | Out-Null
+        $done += $u
+      }
+      $done
+  register: kd_win
+
+- name: Remember connection data for the source host
+  ansible.builtin.set_fact:
+    kd_record:
+      users: "{{ kd_win.output | select('string') | list }}"
+      address: "{{ ansible_host | default(inventory_hostname) }}"
+      alias: "{{ inventory_hostname }}"
+      port: "{{ ansible_port | default(22) }}"

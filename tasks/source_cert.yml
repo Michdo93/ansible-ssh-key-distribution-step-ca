@@ -1,0 +1,127 @@
+---
+# Ensure the key pair of kd_s_user on the source host and (re)issue its certificate.
+# Inputs: kd_s_user, kd_s_key (file name in ~/.ssh), kd_s_principal, kd (control node facts)
+- name: Look up {{ kd_s_user }}
+  ansible.builtin.getent:
+    database: passwd
+    key: "{{ kd_s_user }}"
+
+- name: Remember paths of {{ kd_s_user }}
+  ansible.builtin.set_fact:
+    kd_home: "{{ ansible_facts['getent_passwd'][kd_s_user][4] }}"
+    kd_group: "{{ ansible_facts['getent_passwd'][kd_s_user][2] }}"
+    kd_key: "{{ ansible_facts['getent_passwd'][kd_s_user][4] }}/.ssh/{{ kd_s_key }}"
+
+- name: Ensure ~/.ssh of {{ kd_s_user }}
+  ansible.builtin.file:
+    path: "{{ kd_home }}/.ssh"
+    state: directory
+    owner: "{{ kd_s_user }}"
+    group: "{{ kd_group }}"
+    mode: "0700"
+
+- name: Generate the key pair only if it does not exist yet
+  ansible.builtin.command:
+    cmd: ssh-keygen -q -t {{ key_type }} -N '' -C '{{ kd_s_principal }}' -f '{{ kd_key }}'
+    creates: "{{ kd_key }}"
+
+- name: Derive a missing public key from the private key
+  ansible.builtin.shell:
+    cmd: ssh-keygen -y -f '{{ kd_key }}' > '{{ kd_key }}.pub'
+    creates: "{{ kd_key }}.pub"
+
+- name: Set ownership and permissions of the key pair
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    owner: "{{ kd_s_user }}"
+    group: "{{ kd_group }}"
+    mode: "{{ item.mode }}"
+  loop:
+    - { path: "{{ kd_key }}", mode: "0600" }
+    - { path: "{{ kd_key }}.pub", mode: "0644" }
+
+- name: Read the public key
+  ansible.builtin.slurp:
+    src: "{{ kd_key }}.pub"
+  register: kd_pub_raw
+
+- name: Sign the public key with step-ca (control node)
+  delegate_to: localhost
+  become: false
+  environment:
+    STEPPATH: "{{ ssh_ca_steppath }}"
+  block:
+    - name: Create a temporary directory
+      ansible.builtin.tempfile:
+        state: directory
+        suffix: usercert
+      register: kd_tmp
+      changed_when: false
+
+    - name: Write the public key
+      ansible.builtin.copy:
+        dest: "{{ kd_tmp.path }}/key.pub"
+        content: "{{ kd_pub_raw.content | b64decode }}"
+        mode: "0644"
+      changed_when: false
+
+    - name: Request the certificate for {{ kd_s_principal }}
+      ansible.builtin.command:
+        argv:
+          - step
+          - ssh
+          - certificate
+          - "{{ kd_s_principal }}"
+          - "{{ kd_tmp.path }}/key.pub"
+          - --sign
+          - --force
+          - --provisioner
+          - "{{ kd.kd_provisioner }}"
+          - --provisioner-password-file
+          - "{{ ssh_ca_provisioner_password_file }}"
+          - --not-after
+          - "{{ cert_duration }}"
+          - --principal
+          - "{{ kd_s_principal }}"
+      register: kd_sign
+      changed_when: true
+      failed_when: false
+
+    - name: Read the certificate
+      ansible.builtin.slurp:
+        src: "{{ kd_tmp.path }}/key-cert.pub"
+      register: kd_cert
+      when: kd_sign.rc == 0
+  always:
+    - name: Remove the temporary directory
+      ansible.builtin.file:
+        path: "{{ kd_tmp.path }}"
+        state: absent
+      changed_when: false
+      when: kd_tmp.path is defined
+
+- name: Stop if step-ca refused the certificate
+  ansible.builtin.fail:
+    msg: >-
+      step-ca refused a certificate for the principal {{ kd_s_principal }}:
+      {{ (kd_sign.stdout_lines + kd_sign.stderr_lines) | select('search', '(?i)forbidden|error|not allowed|refused')
+         | unique | join(' ') | trim }}
+      - allow it in the CA policy (authority.policy.ssh.user.allow.principal in ca.json).
+  when: kd_sign.rc != 0
+
+- name: Install the certificate {{ kd_key }}-cert.pub
+  ansible.builtin.copy:
+    dest: "{{ kd_key }}-cert.pub"
+    content: "{{ kd_cert.content | b64decode }}"
+    owner: "{{ kd_s_user }}"
+    group: "{{ kd_group }}"
+    mode: "0644"
+
+- name: Show the validity
+  ansible.builtin.command: ssh-keygen -L -f {{ kd_key }}-cert.pub
+  register: kd_cert_info
+  changed_when: false
+
+- name: Certificate
+  ansible.builtin.debug:
+    msg: "{{ kd_s_user }}@{{ inventory_hostname }}: {{ kd_cert_info.stdout | regex_search('Valid: .*') }}"

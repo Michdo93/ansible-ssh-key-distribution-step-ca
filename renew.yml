@@ -1,0 +1,32 @@
+---
+# Re-issue all certificates registered by distribute.yml (run by cron on the control node).
+#   ansible-playbook renew.yml [--limit <source host>]
+
+- name: Control node
+  hosts: localhost
+  gather_facts: false
+  vars_files: [defaults.yml]
+  tasks:
+    - name: Read the step-ca configuration
+      ansible.builtin.include_tasks: tasks/control_node.yml
+
+- name: Renew certificates on the source hosts
+  hosts: all
+  gather_facts: false
+  become: true
+  vars_files: [defaults.yml]
+  vars:
+    kd: "{{ hostvars['localhost'] }}"
+    kd_mine: "{{ kd.kd_entries | selectattr('source_host', 'equalto', inventory_hostname) | list }}"
+  tasks:
+    - name: Re-issue each certificate of this host
+      ansible.builtin.include_tasks: tasks/source_cert.yml
+      loop: "{{ kd_mine }}"
+      loop_control:
+        loop_var: kd_entry
+        label: "{{ kd_entry.source_user }} ({{ kd_entry.cert_principal }})"
+      vars:
+        kd_s_user: "{{ kd_entry.source_user }}"
+        kd_s_key: "{{ kd_entry.key_file_name }}"
+        kd_s_principal: "{{ kd_entry.cert_principal }}"
+        cert_duration: "{{ kd_entry.cert_duration }}"

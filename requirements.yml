@@ -1,0 +1,4 @@
+---
+# Only needed for Windows targets.
+collections:
+  - name: ansible.windows

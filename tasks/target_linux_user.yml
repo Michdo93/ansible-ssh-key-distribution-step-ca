@@ -1,0 +1,27 @@
+---
+- name: "Look up account {{ kd_target }}"
+  ansible.builtin.getent:
+    database: passwd
+    key: "{{ kd_target }}"
+    fail_key: "{{ not (skip_missing_users | bool) }}"
+
+- name: "Skip missing account {{ kd_target }}"
+  ansible.builtin.debug:
+    msg: "Account {{ kd_target }} does not exist on {{ inventory_hostname }}; skipped."
+  when: ansible_facts['getent_passwd'][kd_target] is none
+
+- name: "Accept {{ cert_principal }} for {{ kd_target }}"
+  when: ansible_facts['getent_passwd'][kd_target] is not none
+  block:
+    - name: "Add {{ cert_principal }} to /etc/ssh/auth_principals/{{ kd_target }}"
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/auth_principals/{{ kd_target }}
+        line: "{{ cert_principal }}"
+        create: true
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: "Remember {{ kd_target }} for the login test"
+      ansible.builtin.set_fact:
+        kd_users_done: "{{ (kd_users_done | default([])) + [kd_target] }}"
